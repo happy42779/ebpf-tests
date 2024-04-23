@@ -1,1 +1,6 @@
 *.o
+*.so
+*.so.*
+*.ll
+*.bak
+dns-loader

@@ -1,4 +1,6 @@
+#include <linux/byteorder/little_endian.h>
 #include <linux/if_ether.h>
+#include <linux/if_link.h>
 #include <linux/if_packet.h>
 #include <linux/in.h>
 #include <linux/ip.h>
@@ -6,81 +8,43 @@
 #include <linux/udp.h>
 
 #include <bpf/bpf_endian.h>
+#include <bpf/bpf_helpers.h>
 #include <linux/bpf.h>
 #include <sys/types.h>
 
-#include "./libbpf/src/bpf_helpers.h"
+// #include "./libbpf/src/bpf_helpers.h"
 
 /*
  * Macros
- * */
-#define XDP_MAX_DNS_ENTRIES                                                    \
-    64 // results maybe deleted after read from user space
-       // therefore, as long as it's big enough for concurrent requests?
-#define XDP_MAX_IP_RESULT 32 // the number of ips returned in a dns response
-
-/* Header cursor to keep track of current parsing position */
-struct hdr_cursor {
-    void *pos;
-};
-
-/*
- * define maps to store dns records
- * */
-struct ip_list {
-    __u32 ip_addr[XDP_MAX_IP_RESULT];
-};
-struct dns_payload {
-    char payload[512];
-};
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __type(key, __u32);
-    __type(value, struct dns_payload);
-    __uint(max_entries, XDP_MAX_DNS_ENTRIES);
-} dns_map SEC(".maps");
-
-/******************* DNS Structure Definition *********************/
-/*
- * Total 12 bytes, DNS header, divided into 6 16-bits double word
- * the second one is flags, consists of 8 fields:
- *		1. QR:		Query Response			1 bit
- *		2. OPCODE:	Operation Code			4 bits
- *		3. AA:		Authoritative answer	1 bit
- *		4. TC:		Truncated Message		1 bit
- *		5. RD:		Recursion Desired		1 bit
- *		6. RA:		Recursion Available		1 bit
- *		7. Z:		Reserved				3 bits
- *		8. RCODE	Response Code			4 bits
  *
- *		use __bexx type, which means big endian type
  */
-struct dnshdr {
-    __be16 id;      // id
-    __be16 flags;   // flags, see above
-    __be16 qdcount; // question count
-    __be16 ancount; // answer count
-    __be16 nscount; // authority count
-    __be16 arcount; // additional count
-};
+// !!! The following definitions should correspond to
+// user space program
+#define MAX_CPUS 64
+#define SAMPLE_SIZE 512ul
+/* struct to define the value size of the perf_event map*/
+struct S {
+    __u16 cookies; // kind of key used to retrieve data
+    __u16 pkt_len; // the length of the packet
+    __u16 nh_off;  // offset of the UDP payload
+} __packed;
 
-struct dnsquest {
-    __u16 type;  // record type
-    __u16 class; // class, always set to 1
-};
+#ifndef __packed
+#define __packed __attribute__((packed))
+#endif
 
-struct dnsrec {
-    __u16 type;  // record type
-    __u16 class; // same above
-    __u32 ttl;   // time to live
-    __u16 len;   // length of record type specific data
-};
+/*
+ * This macro is only used to help with non const size data copy
+ * use with discern with other stuff
+ * */
+#define min(x, y) ((x) < (y) ? (x) : (y))
 
-struct iprec {
-    __u32 ip; // ip address encoded as a four byte integer
-};
-
-/******************* DNS Structure Definition *********************/
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __type(key, int);
+    __type(value, __u32);
+    __uint(max_entries, MAX_CPUS);
+} dns_map SEC(".maps");
 
 /*
  * defining xdp program
@@ -89,80 +53,89 @@ SEC("xdp_dns") int xdp_dnshook_func(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
-    // check if the data boundary is correct,
-    if (data + 1 > data_end) {
-        // return XDP_ABORTED; // trigger trace point
-        // return XDP_DROP;
-        return XDP_PASS;
-    }
-
     struct ethhdr *eth = (struct ethhdr *)data; // ethernet header
-
-    // bpf_printk("Got some  packets\n");
-
-    // check boundary first?
-    if (eth + sizeof(struct ethhdr) > data_end) {
-        return XDP_PASS;
+    __u16 nh_off = sizeof(*eth);
+    // check if the data boundary is correct,
+    if (data + nh_off > data_end) {
+        // return XDP_ABORTED; // trigger trace point
+        return XDP_DROP;
     }
+
     // check if ethernet frame has IPv4 packet
     if (eth->h_proto != bpf_htons(ETH_P_IP)) {
         return XDP_PASS;
     }
 
-    // bpf_printk("Got some IP packets\n");
-
-    struct iphdr *ip = (void *)eth + ETH_HLEN;
-    if (ip + 1 > data_end) {
-        return XDP_PASS;
+    // check ipv4 packet
+    struct iphdr *iph = (void *)data + nh_off;
+    if ((void *)iph + sizeof(struct iphdr) > data_end) {
+        return XDP_DROP;
     }
     // check if datagrams are correct
     // check if it's udp and port 53
     // assuming it's UDP, though in some rare cases it's going to be TCP
-    if (ip->protocol != (IPPROTO_UDP)) {
+    if (iph->protocol != (IPPROTO_UDP)) {
         return XDP_PASS;
     }
-
-    bpf_printk("Got some udp packets here! src ip: %pI4\n", &ip->saddr);
 
     // /* src address could also be check to filter a specific upstream
     // nameserver
     //  */
     //
-    __u32 hdrsize = ip->ihl * 4;
-    struct udphdr *udp = (void *)ip + hdrsize;
+    nh_off += iph->ihl * 4;
+    struct udphdr *udp = (void *)data + nh_off;
     // check boundary before accessing the fileds
-    if (udp + 1 > data_end) {
-        return XDP_PASS;
+    if ((void *)udp + sizeof(struct udphdr) > data_end) {
+        return XDP_DROP;
     }
-    // bpf_printk("I was here\n src port: %ld, dst port: %ld\n",
-    // bpf_ntohs(udp->source), bpf_ntohs(udp->dest));
-    bpf_printk("I was here\n src port: %ld, dst port: %ld\n", (udp->source),
-               (udp->dest));
 
     // // check port, if src port is not 53, ignore
     // // force using the default port
-    if (udp->source != bpf_htons(53)) {
+    if (bpf_ntohs(udp->source) != 53) {
         return XDP_PASS;
     }
-    // // pass it to dns response checker
-    // // trying to print packet info to see if it's correct
-    bpf_printk("packet recvd: %d\n", bpf_ntohs(udp->source));
+
+    // nh_off += sizeof(*udp);
+
+    bpf_printk("Got some udp packets here! Packet len: %d,  src ip: %pI4, src "
+               "port: %ld, dst "
+               "port: %ld\n",
+               bpf_htons(udp->len), &iph->saddr, bpf_ntohs(udp->source),
+               bpf_ntohs(udp->dest));
+
+    // __u16 sample_size = bpf_ntohs(udp->len);
+    // void *payload = (void *)data + nh_off;
+
+    // now write to maps
+    __u16 sample_size = (__u16)(data_end - data);
+
+    // test payload size
+    // bpf_printk("Buffer: %s\n", buffer);
+    // bpf_printk("Size calculated: %ld\n", size);
+    __u64 flags = BPF_F_CURRENT_CPU;
+    int ret;
+    struct S meta;
+    meta.cookies = 0xdead; // name used for user space program
+    meta.pkt_len = min(sample_size, SAMPLE_SIZE);
+    meta.nh_off = nh_off; // staring at the UDP header
+
+    /* The XDP perf_event_output handler will use the upper 32 bits of flags, as
+     * the number of bytes to include of the packet payload in the event data,
+     * reading directly from ctx, the following bit operation will combine
+     * both the flag and size within a 64bit
+     * */
+    flags |= (__u64)sample_size << 32;
+
+    // write to map
+    ret = bpf_perf_event_output(ctx, &dns_map, flags, &meta, sizeof(meta));
+    if (0 != ret) {
+        bpf_printk("perf_event_output failed: %d\n", ret);
+    }
 
     return XDP_PASS;
 }
 
 char _license[] SEC("license") = "GPL";
-
-/* xdp_md: is the metadata for xdp hook
- * In the following case "xdp_abort" is the ELF section name,
- * and "xdp_abort_func" is the BPF program name, both could
- * used to specify which function to be loaded into the kernel, and only one is
- *needed to be specified.
-
- SEC("xdp_abort")
- int xdp_abort_func(struct xdp_md *ctx) { return XDP_ABORTED; }
-
- */
 
 /* Copied from: $KERNEL/include/uapi/linux/bpf.h
  *

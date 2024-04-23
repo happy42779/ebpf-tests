@@ -80,7 +80,7 @@ static void perf_event_cb(void *ctx, int cpu, void *data, __u32 size) {
         __u16 pkt_len;
         __u16 nh_off;
         __u8 pkt_data[SAMPLE_SIZE];
-    } __packed *e = data;
+    } __packed *e = data; // ctx data is in e now
 
     if (e->cookie != 0xdead) {
         printf("BUG cookie: %x sized %d\n", e->cookie, size);
